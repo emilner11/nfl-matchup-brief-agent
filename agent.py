@@ -298,7 +298,8 @@ def get_team_news(team: str) -> dict:
         return {"error": f"could not reach the news service ({type(e).__name__})"}
     return {"team": TEAMS[abbr], "articles": [
         {"title": (a.get("title") or "")[:200], "outlet": (a.get("source") or {}).get("name", ""),
-         "date": (a.get("publishedAt") or "")[:16], "description": (a.get("description") or "")[:240]} for a in arts[:10]]}
+         "date": (a.get("publishedAt") or "")[:16], "description": (a.get("description") or "")[:240],
+         "url": (a.get("url") or "")[:300]} for a in arts[:10]]}
 
 
 
@@ -380,6 +381,9 @@ def _game_context(abbr):
     return (f"Next game: {desc(nxt.iloc[0]) if len(nxt) else 'none scheduled'}. "
             f"Previous game (already played): {desc(prev.iloc[0]) if len(prev) else 'none'}.")
 
+import threading
+_LINKS = threading.local()   # article links for the Sources list; kept out of every model's context
+
 @snap("analyze_news")
 def analyze_news(teams: list) -> dict:
     """Recent team news, already judged by the News Analyst: which headlines matter for the game
@@ -397,6 +401,9 @@ def analyze_news(teams: list) -> dict:
             report.setdefault("errors", []).append(f"{abbr}: {raw['error']}")
             continue
         arts = raw["articles"]
+        if not hasattr(_LINKS, "items"): _LINKS.items = []
+        _LINKS.items += [{"outlet": a.get("outlet", ""), "date": a.get("date", "")[:10], "url": a.get("url", "")} for a in arts]
+        arts = [{k: v for k, v in a.items() if k != "url"} for a in arts]   # the analyst never sees links
         if not arts:
             continue
         report["none_found"] = False
@@ -447,6 +454,7 @@ Rules:
    brackets: [odds], [weather], [stats], or [news]. An answer with facts but no tags is wrong.
    If a tool returns nothing or an error, say the data is missing. Never fill gaps from memory.
 2. Identify the game first with get_game_odds. It gives the opponent, kickoff, stadium, roof, and lines.
+   Write the matchup exactly as the tool's "matchup" field gives it (away team at home team).
    - If the user names a day and the game is on a different day or in a different week, say so.
    - If the user names two teams, call get_game_odds for EACH team. If they play different opponents, say
      they do not play each other, give each team's actual next game from the tool results, and ask which
@@ -454,6 +462,11 @@ Rules:
    - If a team name could mean more than one team (for example "New York" or "LA"), call get_game_odds
      for each possible team, then ask which one, naming each team's game. Do not call any other tool.
    - If a name is not an NFL team, say so and ask which team they mean.
+   - Earlier messages in this chat are context. If the user's new message answers a question you asked
+     (for example, they give a team or player after you asked "which one?"), combine it with their
+     earlier question and answer that question. Do not treat the reply as a brand-new question.
+   - You cannot look up a player's team by name. If the user names only a player, say so and ask which
+     team he plays for, then answer the original question for that team.
 3. Call only the tools the question needs: injuries or news -> analyze_news; weather -> get_game_weather;
    spread, total, or favorite -> the lines from get_game_odds; how a team is playing -> get_team_stats.
    A "full brief" uses all four.
@@ -470,19 +483,102 @@ Rules:
 
 SAVE_CLAIM = re.compile(r"\b(brief|it)\s+(was|has been|is)\s+saved|saved (it )?to (your|my) drive", re.I)
 
+TAG_TOOL = {"odds": "get_game_odds", "weather": "get_game_weather", "stats": "get_team_stats", "news": "analyze_news"}
+TAG_RE = re.compile(r"[\[【]\s*(odds|weather|stats|news)\s*[\]】]", re.I)
+NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+def check_evidence(text, trace):
+    """Fix for Assignment 9 (Evidence). Code, not the model, decides whether a tagged fact is backed:
+    - a sentence tagged [stats] or [news] (etc.) is removed if that tool was not called successfully;
+    - a tagged sentence with a number that appears in no tool result is marked unverified.
+    Returns (checked_text, removed_count, flagged_count)."""
+    ok = {t["tool"] for t in trace if isinstance(t["result"], dict) and "error" not in t["result"]}
+    vals = [float(n) for t in trace for n in NUM_RE.findall(json.dumps(t["result"]))]
+    def known(n):   # in the tool data, allowing normal rounding (49.5 F written as 50 F)
+        n = float(n)
+        return any(abs(n - v) <= 0.5 for v in vals)
+    removed = flagged = 0
+    out_lines = []
+    for line in (text or "").split("\n"):
+        line = TAG_RE.sub(lambda m: "[" + m.group(1).lower() + "]", line)
+        parts = re.split(r"(?<=[.!?\]])\s+(?=[A-Z*\-])", line)
+        kept = []
+        for p in parts:
+            tags = [m.lower() for m in TAG_RE.findall(p)]
+            if tags and any(TAG_TOOL[tg] not in ok for tg in tags):
+                removed += 1
+                continue
+            if tags and not all(known(n) for n in NUM_RE.findall(TAG_RE.sub("", p))):
+                p = p + " (unverified: a number here is not in the tool data)"
+                flagged += 1
+            kept.append(p)
+        joined = " ".join(kept).rstrip()
+        if joined.strip(" -*•:") or not line.strip():
+            out_lines.append(joined)
+    # drop a heading left with nothing under it (its lines were removed above)
+    HEAD = re.compile(r"\s*\*{0,2}[^*\n\[]{1,60}:\*{0,2}\s*(\([^)]*\))?\s*")
+    BULLET = re.compile(r"\s*([-*•]|\d+\.)\s")
+    final = []
+    for i, ln in enumerate(out_lines):
+        if HEAD.fullmatch(ln) and not BULLET.match(ln):
+            nxt = next((x for x in out_lines[i + 1:] if x.strip()), "")
+            if not BULLET.match(nxt):
+                continue
+        final.append(ln)
+    return "\n".join(final).strip(), removed, flagged
+
+def sources_list(trace):
+    """Plain list of what was actually checked for this answer, built from the trace by code."""
+    rows = []
+    for t in trace:
+        r = t["result"] if isinstance(t["result"], dict) else {}
+        if "error" in r:
+            rows.append(f"- {t['tool']}: failed ({r['error']})")
+        elif t["tool"] == "get_game_odds":
+            books = ", ".join(b.get("sportsbook", "") for b in (r.get("lines") or [])) or r.get("lines_note", "no lines")
+            rows.append(f"- [odds] {r.get('matchup', '')}: schedule from nflverse; lines from The Odds API ({books})"
+                        + (f", as of {r['lines_as_of']}" if r.get("lines_as_of") else ""))
+        elif t["tool"] == "get_game_weather":
+            rows.append(f"- [weather] Open-Meteo forecast for {r.get('stadium', '')} at kickoff, as of {r.get('forecast_as_of', '')}")
+        elif t["tool"] == "get_team_stats":
+            rows.append(f"- [stats] {r.get('team', '')}: nflverse results through Week {r.get('through_week', '?')}")
+        elif t["tool"] == "analyze_news":
+            links = getattr(_LINKS, "items", [])
+            hits = []
+            for it in r.get("items", []):
+                if it.get("matters"):
+                    url = next((l["url"] for l in links if l["outlet"] == it["outlet"] and l["date"] == it["date"] and l["url"]), "")
+                    hits.append(f"  - {it['outlet']} ({it['date']}): {url or 'no link'}")
+            rows.append(f"- [news] NewsAPI headlines for {', '.join(r.get('teams', []))}, cutoff {r.get('news_cutoff', '')}")
+            rows += hits[:4]
+    seen, uniq = set(), []
+    for x in rows:
+        if x not in seen:
+            seen.add(x); uniq.append(x)
+    return "\n".join(uniq)
+
 def _final(text, trace, verbose):
-    """Code-level guard: the model may not claim a save that did not happen (Case 6, first run)."""
+    """Code-level guards on the final answer: no false save claims (milestone) and the evidence check (Assignment 9)."""
     text = text or ""
     saved = any(t["tool"] == "save_brief" and isinstance(t["result"], dict) and t["result"].get("saved") for t in trace)
     if SAVE_CLAIM.search(text) and not saved and not re.search(r"not (been )?saved", text, re.I):
         text += "\n\n[Loop check: this brief was NOT saved; save_brief never succeeded.]"
-    if verbose: print("FINAL:", text)
+    text, removed, flagged = check_evidence(text, trace)
+    if removed:
+        text += (f"\n\nNote: I removed {removed} statement(s) that were tagged with a source I did not check "
+                 "for this answer.")
+    if verbose:
+        print(f"EVIDENCE CHECK: removed {removed}, flagged {flagged}")
+        print("FINAL:", text)
     return text
 
-def run_agent(user_msg, max_steps=8, verbose=True, trace=None, on_step=None):
-    """One question in, one brief out. on_step(event) is called for each tool call (used by the web page)."""
+def run_agent(user_msg, max_steps=8, verbose=True, trace=None, on_step=None, history=None):
+    """One question in, one brief out. history = earlier (role, text) turns of this chat, so a reply to a
+    clarifying question keeps its context (Assignment 9 fix). on_step(event) is called for each tool call."""
     refresh_data()
-    messages = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": user_msg}]
+    _LINKS.items = []
+    past = [{"role": r, "content": t} for r, t in (history or [])[-6:]]
+    messages = [{"role": "system", "content": system_prompt()}] + past + [{"role": "user", "content": user_msg}]
     tool_specs = [t["schema"] for t in TOOLS.values()]
     trace = [] if trace is None else trace
     if verbose: print("USER:", user_msg)
