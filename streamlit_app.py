@@ -2,6 +2,8 @@
 Version 1: a plain chat box. Each message is answered on its own, final answer only."""
 import os
 import streamlit as st
+import sys
+sys.stdout.reconfigure(line_buffering=True)   # write log lines right away
 
 # Keys come from the app's Secrets settings, never from the code or the repo.
 for k in ("GROQ_API_KEY", "ODDS_API_KEY", "NEWS_API_KEY"):
